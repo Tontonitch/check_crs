@@ -1,0 +1,196 @@
+#!/usr/bin/perl
+
+# ******************************************************************************
+# *
+# * check_crs   2014-01-05
+# *
+# * Updated:    2015-06-09 - Added 'dbservicelocation' and 'instancestatus' actions
+# *
+# * Copyright 2014 (c) Krzysztof Lewandowski (krzysztof.lewandowski@fastmail.fm)
+# *
+# * Description: Nagios plug-in for Oracle clusterware (11g and above)
+# *              It checks:
+# *					a) clusterware stack status
+# *					b) OCR registry integrity
+# *					c) Voting disks status
+# *					d) resource status (ONLINE/OFFLINE); you can define exceptions with exclude option
+# *					e) database instance status - if it is running as configured 
+# *					f) database service location - if it is running on preferred instance
+# *
+# * This plug-in needs to be run as clusterware binaries owner (usually oracle). 
+# * Configure sudo to work with nrpe-owner.
+# *
+# * Run 'check_crs --help' for full description.
+# *
+# * Setup:
+# *
+# * 1. disable 'requiretty' for nrpe-owner in /etc/sudoers
+# *    Defaults:nagios    !requiretty
+# *   
+# * 2. enable sudo for nrpe-owner to run this script
+# *    nagios          ALL=(oracle) NOPASSWD: /usr/lib64/nagios/plugins/check_crs
+# * 
+# * 3. edit nrpe.cfg and insert required checks with options:
+# * 
+# *    command[check_crs_clusterstatus]=sudo -u oracle /usr/lib64/nagios/plugins/check_crs --crs_home=$CRS_HOME --action=clusterstatus
+# *    command[check_crs_ocrcheck]=sudo -u oracle /usr/lib64/nagios/plugins/check_crs --crs_home=$CRS_HOME --action=ocrcheck
+# *    command[check_crs_votedisk]=sudo -u oracle /usr/lib64/nagios/plugins/check_crs --crs_home=$CRS_HOME --action=votedisk
+# *    command[check_crs_resstatus]=sudo -u oracle /usr/lib64/nagios/plugins/check_crs --crs_home=$CRS_HOME --action=resstatus --exclude=res1.example,res2.example
+# *    command[check_crs_instancestatus]=sudo -u oracle /usr/lib64/nagios/plugins/check_crs --crs_home=$CRS_HOME --action=instancestatus
+# *    command[check_crs_dbservicelocation]=sudo -u oracle /usr/lib64/nagios/plugins/check_crs --crs_home=$CRS_HOME --action=dbservicelocation
+# * 
+# * Sample output:
+# * 
+# * check_crs --crs_home=/oracle/gridhome --action=clusterstatus
+# * [OK] All clusterware services are up (clusterware version: 11.2.0.3.0)
+# * check_crs --crs_home=/oracle/gridhome --action=ocrcheck
+# * [OK] Cluster registry integrity check succeeded - (+CRS: succeeded)
+# * check_crs --crs_home=/oracle/gridhome --action=votedisk
+# * [OK] Voting disks status check succeeded - (/dev/oracleasm/crs_disk_01p1) [CRS]
+# * check_crs --crs_home=/oracle/gridhome --action=resstatus
+# * [OK] All required resources are up
+# * check_crs --crs_home=/oracle/gridhome --action=instancestatus
+# * [OK] All required database instances are up 
+# * check_crs --crs_home=/oracle/gridhome --action=dbservicelocation
+# * [OK] All services are running on preferred instances
+# * 
+# *****************************************************************************
+
+use Getopt::Long qw(:config no_ignore_case);
+
+my ($crs_home, $action, $line, $line2, $crsversion, $output, $ocrlist, $votelist, $offlineres, $clusterstatus);
+
+my $exclude_resource = '';
+my %nagios_exit_codes = ( 'UNKNOWN', 3, 'OK', 0, 'WARNING', 1, 'CRITICAL', 2 );
+my $output_msg = '';
+my $status = 'OK';
+my $action = '';
+my $help = '';
+
+&usage unless GetOptions ('help' => \$help, 'crs_home=s' => \$crs_home, 'action=s' => \$action, 'exclude=s' => \$exclude_resource);
+
+usage() if $help;
+
+$ENV{ORACLE_HOME} = $crs_home;
+delete $ENV{TWO_TASK};
+
+
+$output = qx[${crs_home}/bin/crsctl check crs]; $output =~ s/^\s*\n//gs;
+$clusterstatus=1; map { $clusterstatus=0 if $_ !~ /(is online|appears healthy)/; } split /\n/, $output;
+
+if( ! $clusterstatus ) {
+  print "[CRITICAL] At least one clusterware service is down!\n";
+  exit $nagios_exit_codes{'CRITICAL'};
+}
+
+if( $action eq 'clusterstatus' ){
+
+  $crsversion = qx[${crs_home}/bin/crsctl query crs softwareversion]; chomp $crsversion;
+  $crsversion =~ s/.+?is \[([^\]]+).+/$1/;
+  $output_msg = "All clusterware services are up (clusterware version: $crsversion)";
+}
+elsif( $action eq 'ocrcheck' ) {
+
+  $output_msg = "Cluster registry integrity check succeeded";
+  $ocrlist = '';
+
+  $output = qx[${crs_home}/bin/ocrcheck]; $output =~ s/^\s*\n//gs;
+  $ok=1; map { $ok=0 if $_ =~ /failed/; } split /\n/, $output;
+  $ocrlist = $output; $ocrlist =~ s#.*?Device/File Name\s*:\s*(\S+).+?integrity check\s+(\S+)#\(\1: \2\) #gs; $ocrlist =~ s/\n.*//gs;
+
+  if( ! $ok ) {
+    $output_msg = "OCR file integrity check failed!";
+    $status = 'CRITICAL';
+  }
+  $output_msg .= " - $ocrlist";
+}
+elsif( $action eq 'votedisk' ) {
+
+  $output_msg = "Voting disks status check succeeded";
+  $votelist = '';
+
+  $output = qx[${crs_home}/bin/crsctl query css votedisk]; $output =~ s/^\s*\n//gs;
+  $ok=1; map { $ok=0 if $_ =~ /(failed|OFFLINE|PROC\-)/i; } split /\n/, $output;
+  map { $votelist .= "($1 " if /\((.+?\])/; $votelist .= "($1) " if /^\s*\d+\.\s+\d+\s+(\S+)$/; } split /\n/, $output;
+
+  if( ! $ok ) {
+    $output_msg = "Voting disk status check failed!";
+    $status = 'CRITICAL';
+  }
+  $output_msg .= " - $votelist";
+}
+elsif( $action eq 'resstatus' ) {
+
+  $output_msg = "All required resources are up";
+
+  $offlineres = '';
+  $output = qx[${crs_home}/bin/crs_stat -u];
+  $output =~ s/(\S)\n/$1 /gs;
+  foreach $line (grep { /TARGET=ONLINE/ } grep { /OFFLINE/ } split /\n/, $output) {
+    if( scalar( grep { $line =~ /NAME\=$_ / } split /,/, $exclude_resource) == 0 ) {
+      $offlineres .= "$1 "  if $line =~ /NAME\=(\S+)/;
+      $status = 'CRITICAL';
+    }
+  }
+  $output_msg = "Offline resources: $offlineres" if $offlineres ne '';
+}
+elsif( $action eq 'instancestatus' ) {
+
+  $output_msg = "All required database instances are up";
+
+  $offlineres = '';
+  $output = qx[${crs_home}/bin/crs_stat -u];
+  $output =~ s/(\S)\n/$1 /gs;
+  foreach $line (grep { /NAME=ora\.\w+?\.db/ } split /\n/, $output) {
+    $db= $1 if $line =~ /NAME=ora\.(\w+)?\.db/;
+    foreach $line2 (grep  { ! /is running/ } split /\n/, qx[${crs_home}/bin/srvctl status database -d $db]) {
+      if( scalar( grep { $line2 =~ /\b$_\b/ } split /,/, $exclude_resource) == 0 ) {
+        $offlineres .= "$line2; ";
+        $status = 'CRITICAL';
+      }
+    }
+  }
+  $output_msg = "Offline instances: $offlineres" if $offlineres ne '';
+}
+elsif( $action eq 'dbservicelocation' ) {
+
+  $output_msg = "";
+  $output = qx[${crs_home}/bin/crs_stat -u];
+  $output =~ s/(\S)\n/$1 /gs;
+  foreach $line (grep { /NAME=ora.+?\.svc/ } split /\n/, $output) {
+    if( $line =~ /NAME=ora\.(\w+)?\.(\w+)?\.svc.+?ONLINE on (\w+)/ ) {
+      ($db,$svc,$on)= ($1,$2,$3);
+      #%node2instance = ();
+      #map { $node2instance{$2}=$1 if /Instance (\w+) is running on node (\w+)/ } grep { /is running on node/ } split /\n/, qx[${crs_home}/bin/srvctl status database -d $db];
+      $i_running_on = ""; map { $i_running_on = $1 if /.+?is running on instance\(s\) (\S+)/ } qx[${crs_home}/bin/srvctl status service -d $db -s $svc];
+      $i_preferred = ""; map { $i_preferred = $1 if /Preferred instances: (\w+)/ } qx[${crs_home}/bin/srvctl config service -d $db -s $svc | grep Preferred];
+      if( "$i_preferred" ne "$i_running_on" ) {
+        $output_msg .= "DB: $db, service $svc running on $i_running_on (preferred $i_preferred) ";
+        $status = 'WARNING';
+      }
+    }
+  }
+
+  $output_msg = "All services are running on preferred instances." if( "$output_msg" eq "" );
+}
+
+print "[${status}] $output_msg\n";
+exit $nagios_exit_codes{ $status };
+
+
+########################## SUBROUTINES #######################
+
+sub usage {
+   print qq[
+Usage: $0 --help --crs_home <ORACLE_HOME for clusterware> --action <ACTION> [ --exclude=resource1[,resourceN ..] ]
+
+--help:         prints this info
+--crs_home:     ORACLE_HOME for clusterware
+--action:       clusterstatus|ocrcheck|votedisk|resstatus|instancestatus|dbservicelocation
+--exclude:      resource1[,resourceN ..] - list of resources excluded from status check - use for <resstatus> action
+                or
+                instance1[,instanceN ..] - list of instances excluded from db instance chec - use for <instancestatus> action
+
+];
+   exit $nagios_exit_codes{'WARNING'};
+}
