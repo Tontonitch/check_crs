@@ -74,6 +74,10 @@ usage() if $help;
 $ENV{ORACLE_HOME} = $crs_home;
 delete $ENV{TWO_TASK};
 
+if ( ! -e "${crs_home}/bin/crsctl" ) {
+  print "UNKNOWN - crsctl binary not found\n";
+  exit $nagios_exit_codes{'UNKNOWN'};
+}
 
 $output = qx[${crs_home}/bin/crsctl check crs]; $output =~ s/^\s*\n//gs;
 $clusterstatus=1; map { $clusterstatus=0 if $_ !~ /(is online|appears healthy)/; } split /\n/, $output;
